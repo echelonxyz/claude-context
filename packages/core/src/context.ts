@@ -21,6 +21,7 @@ import {
 import { SemanticSearchResult } from './types';
 import { envManager } from './utils/env-manager';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { execFileSync } from 'node:child_process';
@@ -36,6 +37,36 @@ const LEGACY_BRANCH = '_';
 
 /** Delete Milvus ids in batches of at most this many per delete call. */
 const MAX_DELETE_BATCH = 1000;
+
+/**
+ * Where the lazy overlay refresh records what it last indexed for a
+ * (worktree, branch) pair: `relativePath -> "<mtimeMs>:<size>"`. Kept beside the
+ * merkle snapshots under ~/.context so a fresh MCP process doesn't re-index the
+ * whole touched set on its first search.
+ */
+const OVERLAY_STATE_DIR = 'overlay-state';
+
+/**
+ * How far the base index may fall behind the base branch before a search says so.
+ * The overlay keeps a branch's own files current, but every *untouched* file
+ * answers from the shared base index — so once base drifts, searches quietly
+ * return code that has since moved or been deleted. Ten commits is roughly a
+ * morning's merges on an active repo: high enough not to nag, low enough that a
+ * genuinely stale index is never silent.
+ */
+const BASE_STALENESS_WARN_COMMITS = 10;
+
+/**
+ * Most files one lazy refresh will index inline, before a search.
+ *
+ * A short-lived branch touches a handful of files, but a long-lived one can
+ * differ from base by thousands (measured: 1,510 on a real worktree) — and
+ * embedding those on CPU is minutes, not milliseconds. Past this bound the
+ * refresh declines the work and says so rather than turning one search into a
+ * full index run: keeping freshness cheap is the whole point, and initial
+ * indexing is `index_codebase`'s job, not a search's.
+ */
+const LAZY_REFRESH_MAX_FILES = 200;
 
 /**
  * Thrown by indexCodebase / processFileList when an AbortSignal fires
@@ -164,6 +195,9 @@ export class Context {
     // Cache the branch's touched-file set per `${collectionName}:${branch}` so the
     // two-pass search merge doesn't re-query Milvus on every search.
     private branchPathsCache = new Map<string, Set<string>>();
+    // Worktrees whose overlay was too large to refresh inline, and how many files
+    // they were behind, so a search can say why it is answering from stale rows.
+    private pendingOverlayFiles = new Map<string, number>();
 
     constructor(config: ContextConfig = {}) {
         // Initialize services
@@ -447,6 +481,235 @@ export class Context {
     }
 
     /**
+     * Whether a search should first bring this branch's overlay up to date.
+     * Default on; CODEINDEX_LAZY_REFRESH=false restores search-only behavior.
+     */
+    private lazyRefreshEnabled(): boolean {
+        return (envManager.get('CODEINDEX_LAZY_REFRESH') || '').trim().toLowerCase() !== 'false';
+    }
+
+    /**
+     * State file for one (worktree, branch) overlay. Keyed by the resolved
+     * worktree path — two worktrees on the same branch have distinct working
+     * trees and must not share a stamp map.
+     */
+    private overlayStatePath(codebasePath: string, branch: string): string {
+        const key = crypto.createHash('md5')
+            .update(`${path.resolve(codebasePath)}::${branch}`)
+            .digest('hex');
+        return path.join(os.homedir(), '.context', OVERLAY_STATE_DIR, `${key}.json`);
+    }
+
+    private readOverlayState(statePath: string): Record<string, string> {
+        try {
+            return JSON.parse(fs.readFileSync(statePath, 'utf-8')) as Record<string, string>;
+        } catch {
+            // Missing or corrupt → treat as "nothing indexed yet"; the refresh
+            // rebuilds it from the touched set.
+            return {};
+        }
+    }
+
+    private writeOverlayState(statePath: string, state: Record<string, string>): void {
+        try {
+            fs.mkdirSync(path.dirname(statePath), { recursive: true });
+            fs.writeFileSync(statePath, JSON.stringify(state));
+        } catch (error: any) {
+            // A state write failure only costs redundant work next time.
+            console.warn(`[Context] ⚠️  Could not persist overlay state: ${error?.message || String(error)}`);
+        }
+    }
+
+    /**
+     * Bring a branch's overlay up to date before searching it.
+     *
+     * The overlay is small by construction — the files this branch touches
+     * relative to base — so freshness is cheap to maintain lazily rather than by
+     * watching the filesystem: `git diff` costs milliseconds, one `stat` per
+     * touched file costs microseconds, and only files whose (mtime, size) actually
+     * moved are re-chunked and re-embedded. Unchanged chunks hit the content-hash
+     * embedding cache, so a re-index after a one-line edit is a single file's work.
+     *
+     * Being lazy (rather than a daemon) is what makes this correct across `git
+     * checkout`, rebase, stash and crashes: every search re-derives the touched set
+     * from git instead of trusting accumulated events. A file that leaves the
+     * touched set has its branch rows dropped so the base index shows through again.
+     */
+    private async refreshOverlay(
+        codebasePath: string,
+        additionalIgnorePatterns: string[] = [],
+        additionalSupportedExtensions: string[] = [],
+        splitter?: Splitter
+    ): Promise<{ reindexed: number; dropped: number }> {
+        const unchanged = { reindexed: 0, dropped: 0 };
+        if (!this.lazyRefreshEnabled() || !this.isOverlayBranch(codebasePath)) {
+            return unchanged;
+        }
+
+        const touched = this.touchedFiles(codebasePath);
+        if (!touched) {
+            // Base branch not resolvable locally — indexCodebase would fall back to
+            // a full index here, which is far too expensive to do inside a search.
+            return unchanged;
+        }
+
+        const ignoreMatcher = new IgnoreMatcher(
+            await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns)
+        );
+        const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
+
+        // Stamp every touched file that the indexer would actually accept.
+        const current: Record<string, string> = {};
+        for (const abs of touched) {
+            const relativePath = path.relative(codebasePath, abs);
+            if (!supportedExtensions.includes(path.extname(abs))) continue;
+            if (ignoreMatcher.ignores(relativePath, false)) continue;
+            try {
+                const st = fs.statSync(abs);
+                current[relativePath] = `${st.mtimeMs}:${st.size}`;
+            } catch {
+                // Vanished between the diff and the stat — nothing to index.
+            }
+        }
+
+        const statePath = this.overlayStatePath(codebasePath, this.resolveBranch(codebasePath));
+        const previous = this.readOverlayState(statePath);
+        const changed = Object.keys(current).filter(rel => previous[rel] !== current[rel]);
+        const gone = Object.keys(previous).filter(rel => !(rel in current));
+        if (changed.length === 0 && gone.length === 0) {
+            return unchanged;
+        }
+        if (changed.length > LAZY_REFRESH_MAX_FILES) {
+            // Almost always a worktree that was never indexed, or a branch that has
+            // diverged far from base. Either way this is an indexing job, not a
+            // freshness top-up — declining keeps every search fast and honest.
+            this.pendingOverlayFiles.set(path.resolve(codebasePath), changed.length);
+            console.log(`[Context] 🌿 Overlay refresh declined: ${changed.length} files exceed the ${LAZY_REFRESH_MAX_FILES}-file inline bound`);
+            return unchanged;
+        }
+        this.pendingOverlayFiles.delete(path.resolve(codebasePath));
+
+        const collectionName = this.getCollectionName(codebasePath);
+        const branch = this.resolveBranch(codebasePath);
+
+        // Files that left the touched set (reverted, or rebased onto a base that
+        // now carries the change) must lose their branch rows or they would keep
+        // shadowing a base index that is already correct.
+        for (const rel of gone) {
+            await this.deleteFileChunks(collectionName, rel, branch);
+        }
+        for (const rel of changed) {
+            await this.deleteFileChunks(collectionName, rel, branch);
+        }
+        if (changed.length > 0) {
+            await this.processFileList(
+                changed.map(rel => path.join(codebasePath, rel)),
+                codebasePath,
+                undefined,
+                splitter || this.codeSplitter
+            );
+        }
+
+        this.writeOverlayState(statePath, current);
+        // The shadow set just moved; the next search must not reuse the old one.
+        this.branchPathsCache.clear();
+        console.log(`[Context] 🌿 Overlay refresh on '${branch}': ${changed.length} re-indexed, ${gone.length} dropped`);
+        return { reindexed: changed.length, dropped: gone.length };
+    }
+
+    /**
+     * State file recording the commit the shared base index was built at. One per
+     * repository, since every worktree of the repo shares that base index.
+     */
+    private baseStatePath(codebasePath: string): string {
+        const repoId = this.gitContext(codebasePath)?.repoId ?? 'legacy';
+        return path.join(os.homedir(), '.context', OVERLAY_STATE_DIR, `base-${repoId}.json`);
+    }
+
+    /**
+     * Record which commit the base index now reflects. Called after a successful
+     * index run on the base branch — the only time base rows change.
+     */
+    private recordBaseIndexCommit(codebasePath: string): void {
+        try {
+            const commit = execFileSync('git', ['-C', codebasePath, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+            const statePath = this.baseStatePath(codebasePath);
+            fs.mkdirSync(path.dirname(statePath), { recursive: true });
+            fs.writeFileSync(statePath, JSON.stringify({ commit, indexedAt: new Date().toISOString() }));
+        } catch (error: any) {
+            console.warn(`[Context] ⚠️  Could not record base index commit: ${error?.message || String(error)}`);
+        }
+    }
+
+    /**
+     * How many commits the base branch has moved since the base index was built,
+     * or null when that can't be determined (no record, not a git repo, base tip
+     * unknown locally). Pure git arithmetic — no vector-store access.
+     *
+     * This is the blind spot the file overlay does not cover: a branch's own files
+     * stay current, but everything it did not touch answers from base, and base
+     * only moves when someone re-indexes it. Left unsurfaced, a long-lived index
+     * degrades into confidently-wrong answers.
+     */
+    baseIndexDrift(codebasePath: string): { commits: number; indexedAt: string } | null {
+        try {
+            const raw = fs.readFileSync(this.baseStatePath(codebasePath), 'utf-8');
+            const { commit, indexedAt } = JSON.parse(raw) as { commit?: string; indexedAt?: string };
+            if (!commit) return null;
+            const base = this.baseBranch();
+            // Prefer the remote tip: it is what the base index is expected to track,
+            // and a local base branch may itself be days behind.
+            const tip = ['origin/' + base, base]
+                .map(ref => {
+                    try {
+                        return execFileSync('git', ['-C', codebasePath, 'rev-parse', '--verify', '--quiet', ref], { encoding: 'utf-8' }).trim();
+                    } catch {
+                        return '';
+                    }
+                })
+                .find(Boolean);
+            if (!tip) return null;
+            const count = execFileSync(
+                'git',
+                ['-C', codebasePath, 'rev-list', '--count', `${commit}..${tip}`],
+                { encoding: 'utf-8' }
+            ).trim();
+            return { commits: Number.parseInt(count, 10) || 0, indexedAt: indexedAt || 'unknown' };
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * A one-line warning when the base index has drifted far enough to distrust,
+     * or null when it is fresh enough (or unknown). Surfaced on search results so
+     * staleness is visible at the moment it would mislead someone.
+     */
+    baseStalenessNotice(codebasePath: string): string | null {
+        const drift = this.baseIndexDrift(codebasePath);
+        if (!drift || drift.commits < BASE_STALENESS_WARN_COMMITS) {
+            return null;
+        }
+        return `⚠️ The shared base index is ${drift.commits} commits behind ${this.baseBranch()} ` +
+            `(built ${drift.indexedAt}). Files this branch has not touched answer from that snapshot, ` +
+            `so results may reference code that has since moved. Refresh with \`codeindex index-base\`.`;
+    }
+
+    /**
+     * A one-line warning when this worktree's overlay was too large to bring up to
+     * date inline, so the caller knows the branch's own edits may not be reflected
+     * and what to run about it.
+     */
+    pendingOverlayNotice(codebasePath: string): string | null {
+        const pending = this.pendingOverlayFiles.get(path.resolve(codebasePath));
+        if (!pending) {
+            return null;
+        }
+        return `⚠️ ${pending} changed files on this branch exceed the inline refresh bound, ` +
+            `so this branch's edits are not all indexed. Run \`codeindex index\` for this worktree.`;
+    }
+
+    /**
      * Delete only the rows of a single branch from a shared collection, never the
      * collection itself. Batches deletes so a large branch doesn't overflow a
      * single delete call.
@@ -633,6 +896,12 @@ export class Context {
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
 
+        // Base rows only change on a base-branch run; stamp the commit they now
+        // reflect so searches can tell how far the shared index has drifted.
+        if (!this.isOverlayBranch(codebasePath) && result.status === 'completed') {
+            this.recordBaseIndexCommit(codebasePath);
+        }
+
         progressCallback?.({
             phase: 'Indexing complete!',
             current: result.processedFiles,
@@ -771,6 +1040,16 @@ export class Context {
         if (!hasCollection) {
             console.log(`[Context] ⚠️  Collection '${collectionName}' does not exist. Please index the codebase first.`);
             return [];
+        }
+
+        // Bring this branch's overlay up to date before reading it, so a search
+        // never answers from files the working tree has already moved past. Never
+        // let a refresh failure cost the caller their search — a stale answer beats
+        // no answer.
+        try {
+            await this.refreshOverlay(codebasePath);
+        } catch (error: any) {
+            console.warn(`[Context] ⚠️  Overlay refresh failed, searching as-is: ${error?.message || String(error)}`);
         }
 
         const branch = this.resolveBranch(codebasePath);
