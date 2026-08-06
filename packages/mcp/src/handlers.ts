@@ -813,6 +813,16 @@ export class ToolHandlers {
             if (searchCodebasePath !== absolutePath) {
                 resultMessage += `\nRequested path '${absolutePath}' is covered by indexed codebase '${searchCodebasePath}'.`;
             }
+            // Say it on the results, not in a log nobody reads: a drifted base index
+            // answers plausibly about code that has already moved.
+            for (const notice of [
+                this.context.pendingOverlayNotice(searchCodebasePath),
+                this.context.baseStalenessNotice(searchCodebasePath),
+            ]) {
+                if (notice) {
+                    resultMessage += `\n${notice}`;
+                }
+            }
             resultMessage += `\n\n${formattedResults}`;
 
             if (isIndexing) {
