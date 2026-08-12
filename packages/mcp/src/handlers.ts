@@ -5,7 +5,15 @@ import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError } 
 import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
-import { ensureAbsolutePath, truncateContent, trackCodebasePath } from "./utils.js";
+import {
+    ensureAbsolutePath,
+    truncateContent,
+    trackCodebasePath,
+    rerankByCodeRole,
+    isTestPath,
+    MAX_SEARCH_RESULTS,
+    RERANK_OVERFETCH_FACTOR,
+} from "./utils.js";
 
 export class ToolHandlers {
     private context: Context;
@@ -759,13 +767,18 @@ export class ToolHandlers {
             }
 
             // Search in the specified codebase
-            const searchResults = await this.context.semanticSearch(
+            // Search wider than asked, re-rank, then trim: a re-rank confined to
+            // the caller's limit can only reorder what already won, so an
+            // implementation crowded out by its own tests never enters the list.
+            const rawResults = await this.context.semanticSearch(
                 searchCodebasePath,
                 query,
-                Math.min(resultLimit, 50),
+                Math.min(resultLimit * RERANK_OVERFETCH_FACTOR, MAX_SEARCH_RESULTS),
                 0.3,
                 filterExpr
             );
+
+            const searchResults = rerankByCodeRole(rawResults).slice(0, resultLimit);
 
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
 
@@ -803,8 +816,13 @@ export class ToolHandlers {
                 const context = truncateContent(result.content, 5000);
                 const codebaseInfo = path.basename(searchCodebasePath);
 
+                // Mark tests explicitly: a reader scanning locations should not
+                // have to infer from the path whether they are looking at the
+                // implementation or at something exercising it.
+                const roleTag = isTestPath(result.relativePath) ? ' [test]' : '';
+
                 return `${index + 1}. Code snippet (${result.language}) [${codebaseInfo}]\n` +
-                    `   Location: ${location}\n` +
+                    `   Location: ${location}${roleTag}\n` +
                     `   Rank: ${index + 1}\n` +
                     `   Context: \n\`\`\`${result.language}\n${context}\n\`\`\`\n`;
             }).join('\n');
