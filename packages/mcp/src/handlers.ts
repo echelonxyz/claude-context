@@ -5,7 +5,7 @@ import { Context, COLLECTION_LIMIT_MESSAGE, FileSynchronizer, IndexAbortError } 
 import { SnapshotManager } from "./snapshot.js";
 import type { CodebaseIndexOptions, RequestSplitterType } from "./config.js";
 import { createRequestSplitter, isRequestSplitterType } from "./splitter.js";
-import { ensureAbsolutePath, truncateContent, trackCodebasePath } from "./utils.js";
+import { ensureAbsolutePath, truncateContent, trackCodebasePath, describeToolError, isBackendUnreachableError } from "./utils.js";
 
 export class ToolHandlers {
     private context: Context;
@@ -854,7 +854,9 @@ export class ToolHandlers {
             return {
                 content: [{
                     type: "text",
-                    text: `Error searching code: ${errorMessage} Please check if the codebase has been indexed first.`
+                    text: isBackendUnreachableError(error)
+                        ? describeToolError(error, 'searching code')
+                        : `Error searching code: ${errorMessage} Please check if the codebase has been indexed first.`
                 }],
                 isError: true
             };
@@ -992,7 +994,7 @@ export class ToolHandlers {
             return {
                 content: [{
                     type: "text",
-                    text: `Error clearing index: ${errorMessage}`
+                    text: describeToolError(error, 'clearing index')
                 }],
                 isError: true
             };
@@ -1108,7 +1110,7 @@ export class ToolHandlers {
             return {
                 content: [{
                     type: "text",
-                    text: `Error getting indexing status: ${error.message || error}`
+                    text: describeToolError(error, 'getting indexing status')
                 }],
                 isError: true
             };
