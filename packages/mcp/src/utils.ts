@@ -86,6 +86,19 @@ function getTestRankPenalty(): number {
     return value;
 }
 
+const TEST_SEEKING_QUERY = /\b(tests?|testing|tested|specs?|fixtures?|mocks?|coverage|conftest)\b/i;
+
+/**
+ * Did the caller ask for tests? Demoting them would then be actively wrong.
+ *
+ * Measured: without this, "where do we test entity resolution merging" and
+ * friends lose test hits they should be getting — one such query dropped tests
+ * out of its top 5 entirely.
+ */
+export function isTestSeekingQuery(query: string): boolean {
+    return TEST_SEEKING_QUERY.test(query);
+}
+
 /**
  * Push tests below implementation at comparable relevance.
  *
@@ -98,11 +111,16 @@ function getTestRankPenalty(): number {
  *
  * This demotes, never excludes: sometimes the test *is* the answer ("how do I
  * call this?"), so it should still be reachable, just not ahead of the thing it
- * tests. Set CLAUDE_CONTEXT_TEST_RANK_PENALTY=1 to disable.
+ * tests. A query that asks for tests outright skips the penalty entirely, and
+ * CLAUDE_CONTEXT_TEST_RANK_PENALTY=1 disables it everywhere.
  */
-export function rerankByCodeRole<T extends { relativePath: string; score: number }>(results: T[]): T[] {
+export function rerankByCodeRole<T extends { relativePath: string; score: number }>(
+    results: T[],
+    query?: string
+): T[] {
     const penalty = getTestRankPenalty();
     if (penalty === 1) return results;
+    if (query !== undefined && isTestSeekingQuery(query)) return results;
 
     return results
         .map((result, position) => ({

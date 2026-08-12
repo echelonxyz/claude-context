@@ -778,7 +778,7 @@ export class ToolHandlers {
                 filterExpr
             );
 
-            const searchResults = rerankByCodeRole(rawResults).slice(0, resultLimit);
+            const searchResults = rerankByCodeRole(rawResults, query).slice(0, resultLimit);
 
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
 

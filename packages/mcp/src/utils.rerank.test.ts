@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { isTestPath, rerankByCodeRole } from "./utils.js";
+import { isTestPath, isTestSeekingQuery, rerankByCodeRole } from "./utils.js";
 
 test("test, fixture and mock paths are recognised across ecosystems", () => {
     for (const testPath of [
@@ -89,6 +89,42 @@ test("the penalty can be switched off", () => {
         if (previous === undefined) delete process.env.CLAUDE_CONTEXT_TEST_RANK_PENALTY;
         else process.env.CLAUDE_CONTEXT_TEST_RANK_PENALTY = previous;
     }
+});
+
+test("a query that asks for tests is recognised", () => {
+    for (const query of [
+        "where do we test entity resolution merging",
+        "test coverage for the correction tiers",
+        "unit tests for the Cypher builder",
+        "fixtures used by the extraction tests",
+        "what does conftest.py set up",
+        "the spec for the retry decorator",
+    ]) {
+        assert.equal(isTestSeekingQuery(query), true, `expected test-seeking: ${query}`);
+    }
+
+    for (const query of [
+        "how is a factoid persisted to the graph",
+        "retry with exponential backoff on rate limit",
+        "the latest protestor count endpoint",   // 'latest'/'protestor' must not match
+    ]) {
+        assert.equal(isTestSeekingQuery(query), false, `expected implementation-seeking: ${query}`);
+    }
+});
+
+test("asking for tests skips the penalty entirely", () => {
+    const results = [
+        { relativePath: "tests/nora/test_resolution.py", score: 0.20 },
+        { relativePath: "src/echelon/nora/memory/resolution.py", score: 0.19 },
+    ];
+
+    // Without the query the penalty applies and the implementation is promoted...
+    assert.equal(rerankByCodeRole(results)[0].relativePath, "src/echelon/nora/memory/resolution.py");
+    // ...but when the caller explicitly asked for tests, demoting them is wrong.
+    assert.equal(
+        rerankByCodeRole(results, "where do we test entity resolution")[0].relativePath,
+        "tests/nora/test_resolution.py"
+    );
 });
 
 test("an out-of-range penalty falls back to the default instead of inverting the ranking", () => {
