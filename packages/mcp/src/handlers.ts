@@ -9,6 +9,8 @@ import {
     ensureAbsolutePath,
     truncateContent,
     trackCodebasePath,
+    describeToolError,
+    isBackendUnreachableError,
     rerankByCodeRole,
     isTestPath,
     MAX_SEARCH_RESULTS,
@@ -872,7 +874,9 @@ export class ToolHandlers {
             return {
                 content: [{
                     type: "text",
-                    text: `Error searching code: ${errorMessage} Please check if the codebase has been indexed first.`
+                    text: isBackendUnreachableError(error)
+                        ? describeToolError(error, 'searching code')
+                        : `Error searching code: ${errorMessage} Please check if the codebase has been indexed first.`
                 }],
                 isError: true
             };
@@ -1010,7 +1014,7 @@ export class ToolHandlers {
             return {
                 content: [{
                     type: "text",
-                    text: `Error clearing index: ${errorMessage}`
+                    text: describeToolError(error, 'clearing index')
                 }],
                 isError: true
             };
@@ -1126,7 +1130,7 @@ export class ToolHandlers {
             return {
                 content: [{
                     type: "text",
-                    text: `Error getting indexing status: ${error.message || error}`
+                    text: describeToolError(error, 'getting indexing status')
                 }],
                 isError: true
             };
