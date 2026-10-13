@@ -67,6 +67,8 @@ const BASE_STALENESS_WARN_COMMITS = 10;
  * indexing is `index_codebase`'s job, not a search's.
  */
 const LAZY_REFRESH_MAX_FILES = 200;
+// Per-worktree marker naming the branch a detached checkout indexes as.
+const BRANCH_MARKER_FILE = 'codeindex-branch';
 
 /**
  * Thrown by indexCodebase / processFileList when an AbortSignal fires
@@ -429,7 +431,10 @@ export class Context {
         }
         let result: { branch: string; repoId: string } | null;
         try {
-            const branch = execFileSync('git', ['-C', codebasePath, 'rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf-8' }).trim();
+            let branch = execFileSync('git', ['-C', codebasePath, 'rev-parse', '--abbrev-ref', 'HEAD'], { encoding: 'utf-8' }).trim();
+            if (branch === 'HEAD') {
+                branch = this.detachedBranchMarker(codebasePath) ?? branch;
+            }
             const commonDir = execFileSync('git', ['-C', codebasePath, 'rev-parse', '--git-common-dir'], { encoding: 'utf-8' }).trim();
             const absCommon = path.resolve(codebasePath, commonDir);
             const repoId = crypto.createHash('md5').update(absCommon).digest('hex').substring(0, 8);
@@ -440,6 +445,27 @@ export class Context {
         }
         this.gitCtxCache.set(cacheKey, result);
         return result;
+    }
+
+    /**
+     * The branch a DETACHED worktree indexes as, from a `codeindex-branch` file in
+     * its own git dir (`.git/worktrees/<name>/`), or null when there is none.
+     *
+     * The base index has to be built from a checkout tagged as the base branch,
+     * but git lets only one worktree have that branch checked out — usually a
+     * developer's — and following origin from there would move their checkout.
+     * A managed checkout detached at origin/<base>, marked this way, can be moved
+     * freely. The marker lives in the per-worktree git dir, so it can never leak
+     * onto another worktree of the repo.
+     */
+    private detachedBranchMarker(codebasePath: string): string | null {
+        try {
+            const gitDir = execFileSync('git', ['-C', codebasePath, 'rev-parse', '--absolute-git-dir'], { encoding: 'utf-8' }).trim();
+            const marked = fs.readFileSync(path.join(gitDir, BRANCH_MARKER_FILE), 'utf-8').trim();
+            return marked.length > 0 ? marked : null;
+        } catch {
+            return null;
+        }
     }
 
     /**
@@ -997,9 +1023,6 @@ export class Context {
         if (totalChanges === 0) {
             progressCallback?.({ phase: 'No changes detected', current: 100, total: 100, percentage: 100 });
             console.log('[Context] ✅ No file changes detected.');
-            // Nothing indexable moved, so base rows already reflect HEAD — say so,
-            // or a base that only gained non-indexed commits reads as drifting.
-            this.stampBaseIfBaseBranch(codebasePath);
             return { added: 0, removed: 0, modified: 0 };
         }
 
