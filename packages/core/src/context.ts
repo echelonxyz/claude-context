@@ -535,12 +535,23 @@ export class Context {
      * locally) so callers fall back to indexing all files.
      */
     private touchedFiles(codebasePath: string): Set<string> | null {
-        const base = this.baseBranch();
         try {
-            // Tracked files differing from the base tip, excluding deletions.
+            // Files this branch changed since it left base: diff against the
+            // merge-base, not the base tip. Against the tip, every commit base
+            // gained since the branch was cut reads as a branch edit, so a branch
+            // with no commits of its own measured 6,118 "touched" files (10,190
+            // against a stale local base) where the truth was 0 — the overlay
+            // then re-indexes most of the repo and shadows fresher base rows with
+            // the worktree's older copies. Prefer origin/<base>: the shared base
+            // index follows origin, and a local base branch may be weeks behind.
+            const forkPoint = execFileSync(
+                'git',
+                ['-C', codebasePath, 'merge-base', 'HEAD', this.baseRef(codebasePath)],
+                { encoding: 'utf-8' }
+            ).trim();
             const diff = execFileSync(
                 'git',
-                ['-C', codebasePath, 'diff', '--name-only', '--diff-filter=d', base, '--'],
+                ['-C', codebasePath, 'diff', '--name-only', '--no-renames', '--diff-filter=d', forkPoint, '--'],
                 { encoding: 'utf-8' }
             );
             const untracked = execFileSync(
@@ -561,6 +572,17 @@ export class Context {
         } catch {
             // e.g. base branch not present locally → can't scope, index everything.
             return null;
+        }
+    }
+
+    /** origin/<base> when the remote-tracking ref exists, else the local <base>. */
+    private baseRef(codebasePath: string): string {
+        const base = this.baseBranch();
+        try {
+            execFileSync('git', ['-C', codebasePath, 'rev-parse', '--verify', '--quiet', `refs/remotes/origin/${base}`], { encoding: 'utf-8' });
+            return `origin/${base}`;
+        } catch {
+            return base;
         }
     }
 
