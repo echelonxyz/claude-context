@@ -625,6 +625,17 @@ export class ToolHandlers {
             }, false, customIgnorePatterns, customFileExtensions, requestSplitter, signal);
             console.log(`[BACKGROUND-INDEX] ✅ Indexing completed successfully! Files: ${stats.indexedFiles}, Chunks: ${stats.totalChunks}`);
 
+            if (stats.indexedFiles === 0 && stats.totalChunks === 0) {
+                // A branch that touches no indexable file has no overlay: it is
+                // served entirely by the shared base rows. There is nothing to
+                // register (and 0/0 is refused as a poison state), so drop the
+                // 'indexing' entry rather than leave it stuck at 0% forever.
+                this.snapshotManager.removeCodebaseCompletely(absolutePath);
+                this.snapshotManager.saveCodebaseSnapshot();
+                console.log(`[BACKGROUND-INDEX] No overlay for '${absolutePath}': nothing on this branch differs from base. Searches use the shared base index.`);
+                return;
+            }
+
             // Set codebase to indexed status with complete statistics
             this.snapshotManager.setCodebaseIndexed(absolutePath, stats, indexOptions);
             this.indexingStats = { indexedFiles: stats.indexedFiles, totalChunks: stats.totalChunks };
