@@ -26,7 +26,7 @@ import { MilvusVectorDatabase } from "@zilliz/claude-context-core";
 
 // Import our modular components
 import { createMcpConfig, logConfigurationSummary, showHelpMessage, ContextMcpConfig } from "./config.js";
-import { createEmbeddingInstance, logEmbeddingProviderInfo } from "./embedding.js";
+import { createEmbeddingInstance, createQueryEmbeddingInstance, logEmbeddingProviderInfo } from "./embedding.js";
 import { SnapshotManager } from "./snapshot.js";
 import { SyncManager } from "./sync.js";
 import { ToolHandlers } from "./handlers.js";
@@ -68,6 +68,7 @@ class ContextMcpServer {
         // Initialize Claude Context
         this.context = new Context({
             embedding,
+            queryEmbedding: createQueryEmbeddingInstance(config),
             vectorDatabase,
             collectionNameOverride: config.collectionNameOverride
         });
@@ -265,6 +266,12 @@ This tool is versatile and can be used before completing various tasks to retrie
         // Start background sync after server is connected
         console.log('[SYNC-DEBUG] Initializing background sync...');
         this.syncManager.startBackgroundSync();
+        // Hand the background-sync lease back on the way out, so a standby in
+        // another session takes over at once instead of after the stale window.
+        process.on('exit', () => this.syncManager.stopBackgroundSync());
+        // A stdio server whose client is gone has nothing left to serve; staying
+        // alive would keep holding the lease for a session that no longer exists.
+        process.stdin.on('close', () => process.exit(0));
         console.log('[SYNC-DEBUG] MCP server initialization complete');
     }
 }

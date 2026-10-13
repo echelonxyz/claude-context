@@ -21,6 +21,7 @@ export interface OllamaEmbeddingConfig {
     options?: Record<string, any>;
     dimension?: number; // Optional dimension parameter
     maxTokens?: number; // Optional max tokens parameter
+    requestTimeoutMs?: number; // Per-request bound; defaults to EMBED_REQUEST_TIMEOUT_MS
 }
 
 export class OllamaEmbedding extends Embedding {
@@ -61,7 +62,7 @@ export class OllamaEmbedding extends Embedding {
     private makeClient(host: string): Ollama {
         const providedFetch = this.config.fetch;
         const timeoutFetch = (input: any, init: any = {}) => {
-            const signal = init?.signal ?? AbortSignal.timeout(EMBED_REQUEST_TIMEOUT_MS);
+            const signal = init?.signal ?? AbortSignal.timeout(this.config.requestTimeoutMs ?? EMBED_REQUEST_TIMEOUT_MS);
             return (providedFetch ?? fetch)(input, { ...init, signal });
         };
         return new Ollama({ host, fetch: timeoutFetch });

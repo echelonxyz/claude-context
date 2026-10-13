@@ -282,9 +282,14 @@ export class ToolHandlers {
 
             let hasChanges = false;
 
-            // Remove local codebases that don't exist in cloud
+            // Remove local codebases whose index is gone. A collection is per
+            // repository, so its description names only the worktree that
+            // created it; a sibling worktree's entry is live as long as the
+            // collection it maps to exists.
+            const liveCollections = new Set(collections);
             for (const localCodebase of localCodebases) {
-                if (!cloudCodebases.has(localCodebase)) {
+                if (!cloudCodebases.has(localCodebase)
+                    && !liveCollections.has(this.context.getCollectionName(localCodebase))) {
                     this.snapshotManager.removeCodebaseCompletely(localCodebase);
                     hasChanges = true;
 
@@ -301,8 +306,13 @@ export class ToolHandlers {
             // Add cloud codebases that are missing from local snapshot (recovery).
             // Query Milvus for the real row count — if unknown/empty, skip the write
             // so we don't persist a poisoning 0/0+completed entry (Issue #295).
+            //
+            // Never for a repository-shared collection: its description names
+            // whichever worktree happened to create it, and registering that
+            // path enrols an arbitrary checkout — on whatever branch it is on
+            // today — in the background sync (echelon-codeindex#3).
             for (const cloudCodebase of cloudCodebases) {
-                if (!localCodebases.has(cloudCodebase)) {
+                if (!localCodebases.has(cloudCodebase) && !this.context.isRepositoryShared(cloudCodebase)) {
                     const stats = await this.queryCollectionStats(cloudCodebase);
                     if (stats) {
                         this.snapshotManager.setCodebaseIndexed(cloudCodebase, {
@@ -697,34 +707,22 @@ export class ToolHandlers {
                 .filter((codebase): codebase is string => codebase !== undefined)
                 .sort((a, b) => b.length - a.length)[0];
             let searchCodebasePath = matchedCodebase || absolutePath;
-            let isIndexed = indexedCodebasePath === searchCodebasePath;
+            const isIndexed = indexedCodebasePath === searchCodebasePath;
             const isIndexing = indexingCodebasePath === searchCodebasePath;
 
             if (!isIndexed && !isIndexing) {
-                // Fallback: check VectorDB directly in case snapshot is out of sync.
-                // Only recover the snapshot when we can confirm a real row count —
-                // writing 0/0+completed for an unverifiable collection poisons the
-                // client into a force-reindex loop (Issue #295).
-                const hasVectorIndex = await this.context.hasIndex(absolutePath);
-                if (hasVectorIndex) {
-                    const stats = await this.queryCollectionStats(absolutePath);
-                    if (stats) {
-                        console.warn(`[SEARCH] Snapshot missing but VectorDB has index for '${absolutePath}', recovering snapshot (rows=${stats.totalChunks})`);
-                        this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
-                        this.snapshotManager.saveCodebaseSnapshot();
-                        searchCodebasePath = absolutePath;
-                        isIndexed = true;
-                        // Continue with search (don't return error)
-                    } else {
-                        return {
-                            content: [{
-                                type: "text",
-                                text: `Error: Codebase '${absolutePath}' is not indexed. Please index it first using the index_codebase tool.`
-                            }],
-                            isError: true
-                        };
-                    }
-                } else {
+                // Not tracked here, but the repository's shared collection may
+                // already cover it — every worktree of a repo searches one
+                // collection (base rows + its own overlay). Search it READ-ONLY.
+                //
+                // Never register the path as indexed from here. Collections are
+                // per repository, so "the collection has rows" is true for every
+                // worktree of the repo, including ones never indexed; writing a
+                // snapshot entry would enrol this whole tree in the background
+                // sync, so the act of searching would create the load that makes
+                // searching slow (echelon-codeindex#3). Registration belongs to
+                // index_codebase alone.
+                if (!(await this.context.hasIndex(absolutePath))) {
                     return {
                         content: [{
                             type: "text",
@@ -733,6 +731,8 @@ export class ToolHandlers {
                         isError: true
                     };
                 }
+                searchCodebasePath = absolutePath;
+                console.log(`[SEARCH] '${absolutePath}' is untracked; searching the repository's shared index without registering it`);
             }
 
             // Show indexing status if codebase is being indexed
@@ -1108,7 +1108,21 @@ export class ToolHandlers {
 
                 case 'not_found':
                 default:
-                    statusMessage = `❌ Codebase '${absolutePath}' is not indexed. Please use the index_codebase tool to index it first.`;
+                    // Status is tracked per path, but the index is per repository:
+                    // a worktree nobody indexed still searches the shared
+                    // collection. Saying "not indexed" there sends callers to grep
+                    // for an index that works (echelon-codeindex#2).
+                    if (await this.context.hasIndex(absolutePath)) {
+                        statusMessage = `✅ '${absolutePath}' is searchable through its repository's shared index ` +
+                            `(base branch rows, overlaid with this branch's own files on search). ` +
+                            `It is not tracked separately, and does not need to be — call search_code.`;
+                        const staleness = this.context.baseStalenessNotice(absolutePath);
+                        if (staleness) {
+                            statusMessage += `\n${staleness}`;
+                        }
+                    } else {
+                        statusMessage = `❌ Codebase '${absolutePath}' is not indexed. Please use the index_codebase tool to index it first.`;
+                    }
                     break;
             }
 

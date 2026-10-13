@@ -79,6 +79,30 @@ export function createEmbeddingInstance(config: ContextMcpConfig): OpenAIEmbeddi
     }
 }
 
+// One short query string embeds in well under a second on two CPU cores; past
+// this the query host is wedged and the bulk embedder is the better bet.
+const QUERY_EMBED_TIMEOUT_MS = 15_000;
+
+/**
+ * The embedder reserved for search queries, or undefined when none is
+ * configured. Only Ollama has one: the hosted providers have no local queue for
+ * a query to starve in. Same model as the bulk embedder, so the vectors share a
+ * space; a short per-request timeout keeps a dead query host from stalling a
+ * search before the fallback to the bulk embedder kicks in.
+ */
+export function createQueryEmbeddingInstance(config: ContextMcpConfig): OllamaEmbedding | undefined {
+    if (config.embeddingProvider !== 'Ollama' || !config.ollamaQueryHost) {
+        return undefined;
+    }
+    console.log(`[EMBEDDING] 🔧 Reserving query embedder at ${config.ollamaQueryHost}`);
+    return new OllamaEmbedding({
+        model: config.embeddingModel,
+        host: config.ollamaQueryHost,
+        requestTimeoutMs: QUERY_EMBED_TIMEOUT_MS,
+        ...(config.ollamaDimension && { dimension: config.ollamaDimension })
+    });
+}
+
 export function logEmbeddingProviderInfo(config: ContextMcpConfig, embedding: OpenAIEmbedding | VoyageAIEmbedding | GeminiEmbedding | OllamaEmbedding): void {
     console.log(`[EMBEDDING] ✅ Successfully initialized ${config.embeddingProvider} embedding provider`);
     console.log(`[EMBEDDING] Provider details - Model: ${config.embeddingModel}, Dimension: ${embedding.getDimension()}`);

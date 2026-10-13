@@ -18,6 +18,8 @@ export interface ContextMcpConfig {
     // Ollama configuration
     ollamaModel?: string;
     ollamaHost?: string;
+    // Reserved embedder for search queries (same model, separate instance)
+    ollamaQueryHost?: string;
     ollamaDimension?: number;
     // Vector database configuration
     milvusAddress?: string; // Optional, can be auto-resolved from token
@@ -180,6 +182,7 @@ export function createMcpConfig(): ContextMcpConfig {
         // Ollama configuration
         ollamaModel: envManager.get('OLLAMA_MODEL'),
         ollamaHost: envManager.get('OLLAMA_HOST'),
+        ollamaQueryHost: envManager.get('OLLAMA_QUERY_HOST'),
         ollamaDimension: getPositiveIntegerFromEnv('EMBEDDING_DIMENSION'),
         // Vector database configuration - address can be auto-resolved from token
         milvusAddress: envManager.get('MILVUS_ADDRESS'), // Optional, can be resolved from token
@@ -226,6 +229,7 @@ export function logConfigurationSummary(config: ContextMcpConfig): void {
             break;
         case 'Ollama':
             console.log(`[MCP]   Ollama Host: ${config.ollamaHost || 'http://127.0.0.1:11434'}`);
+            console.log(`[MCP]   Ollama Query Host: ${config.ollamaQueryHost || 'NOT SET (queries share the bulk host)'}`);
             console.log(`[MCP]   Ollama Model: ${config.embeddingModel}`);
             if (config.ollamaDimension) {
                 console.log(`[MCP]   Ollama Embedding Dimension: ${config.ollamaDimension}`);
@@ -265,6 +269,9 @@ Environment Variables:
   Ollama Configuration:
   OLLAMA_HOST             Ollama server host (default: http://127.0.0.1:11434)
   OLLAMA_MODEL            Ollama model name (alternative to EMBEDDING_MODEL for Ollama)
+  OLLAMA_QUERY_HOST       Separate Ollama instance for search-query embeddings, so
+                          indexing never queues in front of a search (optional;
+                          falls back to OLLAMA_HOST when unset or unreachable)
   
   Vector Database Configuration:
   MILVUS_ADDRESS          Milvus address (optional, can be auto-resolved from token)

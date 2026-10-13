@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
+import { SyncLease } from "./sync-lease.js";
 import { SyncManager } from "./sync.js";
 
 /**
@@ -20,7 +24,11 @@ test("a failing periodic sync is contained instead of escaping as an unhandled r
     const onUnhandled = (reason: unknown) => escaped.push(reason);
     process.on("unhandledRejection", onUnhandled);
 
-    const manager = new SyncManager({} as any, {} as any);
+    // A private lease, so the test neither touches ~/.context nor defers to a
+    // real MCP server that happens to own sync on this machine.
+    const leaseDir = await mkdtemp(path.join(os.tmpdir(), "claude-context-sync-"));
+    const lease = new SyncLease({ lockPath: path.join(leaseDir, "mcp-sync.lock") });
+    const manager = new SyncManager({} as any, {} as any, { lease });
     let ticks = 0;
     (manager as any).handleSyncIndex = async () => {
         ticks += 1;
@@ -38,6 +46,7 @@ test("a failing periodic sync is contained instead of escaping as an unhandled r
     } finally {
         process.off("unhandledRejection", onUnhandled);
         manager.stopBackgroundSync();
+        await rm(leaseDir, { recursive: true, force: true });
         if (previousInterval === undefined) delete process.env.CLAUDE_CONTEXT_SYNC_INTERVAL_MS;
         else process.env.CLAUDE_CONTEXT_SYNC_INTERVAL_MS = previousInterval;
     }

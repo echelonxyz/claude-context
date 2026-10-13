@@ -5,12 +5,24 @@ import { Context, FileSynchronizer, envManager } from "@zilliz/claude-context-co
 import { SnapshotManager } from "./snapshot.js";
 import type { RequestSplitterType } from "./config.js";
 import { createRequestSplitter, resolveRequestSplitterType } from "./splitter.js";
+import { SyncLease } from "./sync-lease.js";
 
+// First sync after startup: a short settle delay, spread by up to
+// INITIAL_SYNC_JITTER_MS so sessions started together do not wake together.
 const DEFAULT_INITIAL_SYNC_DELAY_MS = 5_000;
-const DEFAULT_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+const INITIAL_SYNC_JITTER_MS = 30_000;
+// Only the lease owner syncs, and the branch overlay is refreshed lazily on
+// every search, so the background pass is a backstop for base checkouts — it
+// does not need to run every five minutes.
+const DEFAULT_SYNC_INTERVAL_MS = 15 * 60 * 1000;
 const MIN_SYNC_INTERVAL_MS = 1_000;
-const DEFAULT_SYNC_LOCK_STALE_MS = 10 * 60 * 1000;
-const SYNC_LOCK_STALE_ENV = "CLAUDE_CONTEXT_SYNC_LOCK_STALE_MS";
+// Each interval is drawn from [1 - j, 1 + j] x the configured one.
+const DEFAULT_SYNC_JITTER = 0.2;
+// How often a standby checks whether the owner has gone. Cheap: one stat.
+const STANDBY_POLL_MS = 60_000;
+// Owner heartbeat; well inside the lease's stale window (sync-lease.ts) and the
+// 10-minute window older builds use to reclaim the same lock.
+const LEASE_HEARTBEAT_MS = 30_000;
 
 function isBackgroundSyncEnabled(): boolean {
     const value = envManager.get("CLAUDE_CONTEXT_BACKGROUND_SYNC");
@@ -56,104 +68,73 @@ function getBackgroundSyncIntervalMs(): number {
     return intervalMs;
 }
 
+function getSyncJitter(): number {
+    const value = envManager.get("CLAUDE_CONTEXT_SYNC_JITTER");
+    const jitter = value === undefined ? NaN : Number.parseFloat(value);
+    return Number.isFinite(jitter) && jitter >= 0 && jitter < 1 ? jitter : DEFAULT_SYNC_JITTER;
+}
+
+/** `ms` spread uniformly over [1 - jitter, 1 + jitter], never below the floor. */
+export function jittered(ms: number, jitter: number, random: () => number = Math.random): number {
+    const factor = 1 - jitter + 2 * jitter * random();
+    return Math.max(MIN_SYNC_INTERVAL_MS, Math.round(ms * factor));
+}
+
+export interface SyncManagerOptions {
+    lease?: SyncLease;
+}
+
 export class SyncManager {
     private context: Context;
     private snapshotManager: SnapshotManager;
     private isSyncing: boolean = false;
-    private syncLockToken: string | null = null;
+    private readonly lease: SyncLease;
     private triggerWatcher: fs.FSWatcher | null = null;
     private triggerDebounceTimer: NodeJS.Timeout | null = null;
-    private syncInterval: NodeJS.Timeout | null = null;
+    private syncTimer: NodeJS.Timeout | null = null;
+    private heartbeatTimer: NodeJS.Timeout | null = null;
+    private stopped: boolean = false;
 
-    constructor(context: Context, snapshotManager: SnapshotManager) {
+    constructor(context: Context, snapshotManager: SnapshotManager, options: SyncManagerOptions = {}) {
         this.context = context;
         this.snapshotManager = snapshotManager;
+        this.lease = options.lease ?? new SyncLease();
     }
 
-    private getSyncLockPath(): string {
-        return path.join(os.homedir(), ".context", "mcp-sync.lock");
-    }
-
-    private getSyncLockStaleMs(): number {
-        const value = process.env[SYNC_LOCK_STALE_ENV];
-        if (!value) {
-            return DEFAULT_SYNC_LOCK_STALE_MS;
-        }
-
-        const staleMs = Number.parseInt(value, 10);
-        if (!Number.isFinite(staleMs) || staleMs <= 0) {
-            console.warn(`[SYNC-DEBUG] Invalid ${SYNC_LOCK_STALE_ENV} value '${value}'. Falling back to ${DEFAULT_SYNC_LOCK_STALE_MS}ms.`);
-            return DEFAULT_SYNC_LOCK_STALE_MS;
-        }
-
-        return staleMs;
-    }
-
-    private acquireGlobalSyncLock(): boolean {
-        const lockPath = this.getSyncLockPath();
-        const staleMs = this.getSyncLockStaleMs();
-        const token = `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        fs.mkdirSync(path.dirname(lockPath), { recursive: true });
-
-        try {
-            fs.mkdirSync(lockPath);
-            fs.writeFileSync(path.join(lockPath, "owner.json"), JSON.stringify({
-                pid: process.pid,
-                token,
-                acquiredAt: new Date().toISOString()
-            }, null, 2));
-            this.syncLockToken = token;
-            console.log(`[SYNC-DEBUG] Acquired global sync lock: ${lockPath}`);
-            return true;
-        } catch (error: any) {
-            if (error?.code !== "EEXIST") {
-                console.warn(`[SYNC-DEBUG] Failed to acquire global sync lock: ${error?.message || String(error)}`);
-                return false;
-            }
-
-            try {
-                const stat = fs.statSync(lockPath);
-                if (Date.now() - stat.mtimeMs > staleMs) {
-                    const stalePath = `${lockPath}.stale-${process.pid}-${Date.now()}`;
-                    console.warn(`[SYNC-DEBUG] Reclaiming stale global sync lock: ${lockPath}`);
-                    fs.renameSync(lockPath, stalePath);
-                    fs.rmSync(stalePath, { recursive: true, force: true });
-                    fs.mkdirSync(lockPath);
-                    fs.writeFileSync(path.join(lockPath, "owner.json"), JSON.stringify({
-                        pid: process.pid,
-                        token,
-                        acquiredAt: new Date().toISOString(),
-                        recoveredStaleLock: true
-                    }, null, 2));
-                    this.syncLockToken = token;
-                    console.log(`[SYNC-DEBUG] Acquired global sync lock after stale cleanup: ${lockPath}`);
-                    return true;
-                }
-            } catch (statError: any) {
-                console.warn(`[SYNC-DEBUG] Could not inspect global sync lock: ${statError?.message || String(statError)}`);
-            }
-
-            console.log("[SYNC-DEBUG] Another MCP process is already syncing. Skipping this cycle.");
+    /**
+     * Whether this process may run a sync now: it owns the machine-wide lease,
+     * taking it over if the previous owner is gone. Starting the heartbeat on
+     * the first acquisition keeps the lease ours for the rest of our life.
+     */
+    private ensureSyncOwner(): boolean {
+        const wasHeld = this.lease.isHeld();
+        if (!this.lease.tryAcquire()) {
+            const owner = this.lease.readOwner();
+            console.log(`[SYNC-DEBUG] Standing by: background sync is owned by pid ${owner?.pid ?? 'unknown'}.`);
             return false;
         }
+        if (!wasHeld) {
+            console.log(`[SYNC] This process (pid ${process.pid}) now owns background sync for the machine.`);
+            this.startHeartbeat();
+        }
+        return true;
     }
 
-    private releaseGlobalSyncLock(): void {
-        const lockPath = this.getSyncLockPath();
-        try {
-            const ownerPath = path.join(lockPath, "owner.json");
-            if (this.syncLockToken && fs.existsSync(ownerPath)) {
-                const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
-                if (owner.token && owner.token !== this.syncLockToken) {
-                    console.warn(`[SYNC-DEBUG] Global sync lock is owned by another process. Skipping release: ${lockPath}`);
-                    return;
-                }
+    private startHeartbeat(): void {
+        if (this.heartbeatTimer) return;
+        this.heartbeatTimer = setInterval(() => {
+            if (!this.lease.heartbeat()) {
+                console.warn('[SYNC] Lost the background-sync lease; standing by.');
+                this.stopHeartbeat();
             }
-            fs.rmSync(lockPath, { recursive: true, force: true });
-            this.syncLockToken = null;
-            console.log(`[SYNC-DEBUG] Released global sync lock: ${lockPath}`);
-        } catch (error: any) {
-            console.warn(`[SYNC-DEBUG] Failed to release global sync lock: ${error?.message || String(error)}`);
+        }, LEASE_HEARTBEAT_MS);
+        this.heartbeatTimer.unref?.();
+    }
+
+    private stopHeartbeat(): void {
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
         }
     }
 
@@ -175,7 +156,7 @@ export class SyncManager {
             return;
         }
 
-        if (!this.acquireGlobalSyncLock()) {
+        if (!this.ensureSyncOwner()) {
             return;
         }
 
@@ -265,7 +246,6 @@ export class SyncManager {
             console.error(`[SYNC-DEBUG] Error stack:`, error.stack);
         } finally {
             this.isSyncing = false;
-            this.releaseGlobalSyncLock();
             const totalElapsed = Date.now() - syncStartTime;
             console.log(`[SYNC-DEBUG] handleSyncIndex() finished at ${new Date().toISOString()}, total duration: ${totalElapsed}ms`);
         }
@@ -282,50 +262,64 @@ export class SyncManager {
             return;
         }
 
-        const syncIntervalMs = getBackgroundSyncIntervalMs();
+        const intervalMs = getBackgroundSyncIntervalMs();
+        const jitter = getSyncJitter();
+        this.stopped = false;
 
-        // Execute initial sync immediately after a short delay to let server initialize
-        console.log(`[SYNC-DEBUG] Scheduling initial sync in ${DEFAULT_INITIAL_SYNC_DELAY_MS}ms...`);
-        setTimeout(async () => {
-            console.log('[SYNC-DEBUG] Executing initial sync after server startup');
-            try {
-                await this.handleSyncIndex();
-            } catch (error) {
-                const errorMessage = error instanceof Error ? error.message : String(error);
-                if (errorMessage.includes('Failed to query collection')) {
-                    console.log('[SYNC-DEBUG] Collection not yet established, this is expected for new cluster users. Will retry on next sync cycle.');
-                } else {
-                    console.error('[SYNC-DEBUG] Initial sync failed with unexpected error:', error);
-                    // Do not re-throw here: this callback runs via setTimeout with no caller to propagate to.
-                }
-            }
-        }, DEFAULT_INITIAL_SYNC_DELAY_MS);
-
-        // Periodically check for file changes and update the index
-        console.log(`[SYNC-DEBUG] Setting up periodic sync every ${syncIntervalMs}ms`);
-        this.syncInterval = setInterval(() => {
-            console.log('[SYNC-DEBUG] Executing scheduled periodic sync');
-            // Fire-and-forget with an explicit catch, like the initial sync above
-            // and the trigger watcher below: a rejection here has no caller to
-            // propagate to, so without this it escapes as an unhandled rejection
-            // and — before the guard in index.ts — killed the whole server.
-            void this.handleSyncIndex().catch((error) => {
-                console.error('[SYNC-DEBUG] Periodic sync failed:', error);
-            });
-        }, syncIntervalMs);
-
-        console.log('[SYNC-DEBUG] Background sync setup complete. Interval ID:', this.syncInterval);
+        const firstDelay = Math.min(
+            DEFAULT_INITIAL_SYNC_DELAY_MS + Math.round(Math.random() * INITIAL_SYNC_JITTER_MS),
+            intervalMs
+        );
+        console.log(`[SYNC-DEBUG] Background sync: first check in ${firstDelay}ms, then every ~${intervalMs}ms (±${Math.round(jitter * 100)}%) while this process owns the machine-wide lease.`);
+        this.scheduleTick(firstDelay, intervalMs, jitter);
     }
 
     /**
-     * Stop the periodic sync. The handle used to be a local that nothing kept,
-     * so the timer could not be cancelled once started — which also made the
-     * loop untestable without leaking a live interval into the test runner.
+     * One self-rescheduling timer instead of a fixed setInterval: the owner
+     * waits a jittered interval between passes, a standby re-checks the lease
+     * every minute so it can take over promptly when the owner exits.
+     */
+    private scheduleTick(delayMs: number, intervalMs: number, jitter: number): void {
+        if (this.stopped) return;
+        this.syncTimer = setTimeout(async () => {
+            let owner = false;
+            try {
+                owner = this.ensureSyncOwner();
+                if (owner) {
+                    console.log('[SYNC-DEBUG] Executing scheduled background sync');
+                    await this.handleSyncIndex();
+                }
+            } catch (error) {
+                // A rejection here has no caller to propagate to; escaping as an
+                // unhandled rejection would take the whole server down.
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                if (errorMessage.includes('Failed to query collection')) {
+                    console.log('[SYNC-DEBUG] Collection not yet established; will retry on the next cycle.');
+                } else {
+                    console.error('[SYNC-DEBUG] Background sync failed:', error);
+                }
+            }
+            const next = owner ? jittered(intervalMs, jitter) : jittered(Math.min(STANDBY_POLL_MS, intervalMs), jitter);
+            this.scheduleTick(next, intervalMs, jitter);
+        }, delayMs);
+        this.syncTimer.unref?.();
+    }
+
+    /**
+     * Stop syncing and hand the lease back so a standby can take over at once
+     * rather than after the stale window. Idempotent; safe from an exit handler.
      */
     public stopBackgroundSync(): void {
-        if (this.syncInterval) {
-            clearInterval(this.syncInterval);
-            this.syncInterval = null;
+        this.stopped = true;
+        if (this.syncTimer) {
+            clearTimeout(this.syncTimer);
+            this.syncTimer = null;
+        }
+        this.stopHeartbeat();
+        try {
+            this.lease.release();
+        } catch (error) {
+            console.warn('[SYNC-DEBUG] Could not release the background-sync lease:', error);
         }
     }
 

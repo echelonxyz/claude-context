@@ -168,6 +168,13 @@ const DEFAULT_IGNORE_PATTERNS = [
 
 export interface ContextConfig {
     embedding?: Embedding;
+    /**
+     * Optional embedder reserved for search queries. When set, a query is
+     * embedded here instead of on `embedding`, so bulk indexing can never queue
+     * in front of it; on failure the query falls back to `embedding`. Must
+     * produce vectors in the same space (same model) as `embedding`.
+     */
+    queryEmbedding?: Embedding;
     vectorDatabase?: VectorDatabase;
     codeSplitter?: Splitter;
     supportedExtensions?: string[];
@@ -181,6 +188,7 @@ export class Context {
     private static readonly MAX_COLLECTION_NAME_LENGTH = 255;
 
     private embedding: Embedding;
+    private queryEmbedding: Embedding | null;
     private vectorDatabase: VectorDatabase;
     private codeSplitter: Splitter;
     private supportedExtensions: string[];
@@ -213,6 +221,9 @@ export class Context {
         // a re-clone at a different path). Enabled by default; opt out with
         // EMBEDDING_CACHE=false. Override the location with EMBEDDING_CACHE_DIR.
         this.embedding = this.maybeWrapWithEmbeddingCache(this.embedding);
+        // Deliberately not cache-wrapped: a query is embedded once per search,
+        // and query strings have no business in the shared chunk cache.
+        this.queryEmbedding = config.queryEmbedding || null;
 
         if (!config.vectorDatabase) {
             throw new Error('VectorDatabase is required. Please provide a vectorDatabase instance in the config.');
@@ -280,6 +291,22 @@ export class Context {
      */
     getEmbedding(): Embedding {
         return this.embedding;
+    }
+
+    /**
+     * Embed a search query: on the reserved query embedder when one is
+     * configured, else on the bulk embedder. A query embedder that fails (down,
+     * timed out) costs the caller a fallback, never the search.
+     */
+    async embedQuery(query: string): Promise<EmbeddingVector> {
+        if (this.queryEmbedding) {
+            try {
+                return await this.queryEmbedding.embed(query);
+            } catch (error: any) {
+                console.warn(`[Context] ⚠️  Query embedder failed, falling back to the bulk embedder: ${error?.message || String(error)}`);
+            }
+        }
+        return this.embedding.embed(query);
     }
 
     /**
@@ -413,6 +440,16 @@ export class Context {
         }
         this.gitCtxCache.set(cacheKey, result);
         return result;
+    }
+
+    /**
+     * Whether this path shares its collection with the other worktrees of its
+     * repository (the branch overlay), rather than owning a per-path collection.
+     * For a shared collection, "the collection has rows" says nothing about
+     * whether THIS path was ever indexed.
+     */
+    public isRepositoryShared(codebasePath: string): boolean {
+        return this.gitContext(codebasePath) !== null;
     }
 
     /**
@@ -630,6 +667,13 @@ export class Context {
      * Record which commit the base index now reflects. Called after a successful
      * index run on the base branch — the only time base rows change.
      */
+    private stampBaseIfBaseBranch(codebasePath: string): void {
+        const ctx = this.gitContext(codebasePath);
+        if (ctx !== null && ctx.branch === this.baseBranch()) {
+            this.recordBaseIndexCommit(codebasePath);
+        }
+    }
+
     private recordBaseIndexCommit(codebasePath: string): void {
         try {
             const commit = execFileSync('git', ['-C', codebasePath, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
@@ -953,6 +997,9 @@ export class Context {
         if (totalChanges === 0) {
             progressCallback?.({ phase: 'No changes detected', current: 100, total: 100, percentage: 100 });
             console.log('[Context] ✅ No file changes detected.');
+            // Nothing indexable moved, so base rows already reflect HEAD — say so,
+            // or a base that only gained non-indexed commits reads as drifting.
+            this.stampBaseIfBaseBranch(codebasePath);
             return { added: 0, removed: 0, modified: 0 };
         }
 
@@ -993,6 +1040,9 @@ export class Context {
             );
         }
 
+        // An incremental sync of a base-branch checkout moves base rows just as a
+        // full index does; stamp it so drift is measured from what is indexed now.
+        this.stampBaseIfBaseBranch(codebasePath);
         console.log(`[Context] ✅ Re-indexing complete. Added: ${added.length}, Removed: ${removed.length}, Modified: ${modified.length}`);
         progressCallback?.({ phase: 'Re-indexing complete!', current: totalChanges, total: totalChanges, percentage: 100 });
 
@@ -1054,14 +1104,16 @@ export class Context {
 
         const branch = this.resolveBranch(codebasePath);
         const base = this.baseBranch();
+        // Embed once: both overlay passes search with the same query vector.
+        const queryEmbedding = await this.embedQuery(query);
 
         // A search from the base branch (or with the overlay off) sees only its own
         // branch's rows — the branch filter scopes it to a single namespace.
         if (!this.isOverlayBranch(codebasePath)) {
             const scoped = this.composeFilter(filterExpr, `branch == "${branch}"`);
             const results = isHybrid === true
-                ? await this.hybridSearchMapped(collectionName, query, topK, scoped)
-                : await this.vectorSearchMapped(collectionName, query, topK, threshold, scoped);
+                ? await this.hybridSearchMapped(collectionName, query, queryEmbedding, topK, scoped)
+                : await this.vectorSearchMapped(collectionName, queryEmbedding, topK, threshold, scoped);
             const dedupedResults = this.deduplicateResults(results);
             console.log(`[Context] ✅ Found ${results.length} results, ${dedupedResults.length} after dedup`);
             return dedupedResults;
@@ -1073,11 +1125,11 @@ export class Context {
         const mainFilter = this.composeFilter(filterExpr, `branch == "${base}"`);
 
         const branchResults = isHybrid === true
-            ? await this.hybridSearchMapped(collectionName, query, topK, branchFilter)
-            : await this.vectorSearchMapped(collectionName, query, topK, threshold, branchFilter);
+            ? await this.hybridSearchMapped(collectionName, query, queryEmbedding, topK, branchFilter)
+            : await this.vectorSearchMapped(collectionName, queryEmbedding, topK, threshold, branchFilter);
         const mainResults = isHybrid === true
-            ? await this.hybridSearchMapped(collectionName, query, topK, mainFilter)
-            : await this.vectorSearchMapped(collectionName, query, topK, threshold, mainFilter);
+            ? await this.hybridSearchMapped(collectionName, query, queryEmbedding, topK, mainFilter)
+            : await this.vectorSearchMapped(collectionName, queryEmbedding, topK, threshold, mainFilter);
 
         const branchPaths = await this.getBranchPaths(collectionName, branch);
         const merged = [
@@ -1094,9 +1146,7 @@ export class Context {
      * Run a single hybrid (dense + sparse RRF) search and map to SemanticSearchResult[]
      * without dedup so callers can merge multiple passes. filterExpr scopes the rows.
      */
-    private async hybridSearchMapped(collectionName: string, query: string, topK: number, filterExpr?: string): Promise<SemanticSearchResult[]> {
-        const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
-
+    private async hybridSearchMapped(collectionName: string, query: string, queryEmbedding: EmbeddingVector, topK: number, filterExpr?: string): Promise<SemanticSearchResult[]> {
         const searchRequests: HybridSearchRequest[] = [
             { data: queryEmbedding.vector, anns_field: "vector", param: { "nprobe": 10 }, limit: topK },
             { data: query, anns_field: "sparse_vector", param: { "drop_ratio_search": 0.2 }, limit: topK }
@@ -1122,9 +1172,7 @@ export class Context {
      * Run a single dense vector search and map to SemanticSearchResult[] without
      * dedup so callers can merge multiple passes. filterExpr scopes the rows.
      */
-    private async vectorSearchMapped(collectionName: string, query: string, topK: number, threshold: number, filterExpr?: string): Promise<SemanticSearchResult[]> {
-        const queryEmbedding: EmbeddingVector = await this.embedding.embed(query);
-
+    private async vectorSearchMapped(collectionName: string, queryEmbedding: EmbeddingVector, topK: number, threshold: number, filterExpr?: string): Promise<SemanticSearchResult[]> {
         const searchResults: VectorSearchResult[] = await this.vectorDatabase.search(
             collectionName,
             queryEmbedding.vector,
