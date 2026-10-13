@@ -469,6 +469,27 @@ export class Context {
     }
 
     /**
+     * How a checkout relates to its repository's base index: `managed` for a
+     * detached checkout marked to index as the base branch, `unmanaged` for an
+     * ordinary checkout that happens to have the base branch checked out, and
+     * `not-base` for everything else (including non-git paths). Paired with
+     * repositoryId so a caller can tell when two checkouts would both write base
+     * rows into the same collection.
+     */
+    public baseCheckoutRole(codebasePath: string): 'managed' | 'unmanaged' | 'not-base' {
+        const ctx = this.gitContext(codebasePath);
+        if (ctx === null || ctx.branch !== this.baseBranch()) {
+            return 'not-base';
+        }
+        return this.detachedBranchMarker(codebasePath) !== null ? 'managed' : 'unmanaged';
+    }
+
+    /** The shared-collection key of a checkout's repository, or null outside git. */
+    public repositoryId(codebasePath: string): string | null {
+        return this.gitContext(codebasePath)?.repoId ?? null;
+    }
+
+    /**
      * Whether this path shares its collection with the other worktrees of its
      * repository (the branch overlay), rather than owning a per-path collection.
      * For a shared collection, "the collection has rows" says nothing about

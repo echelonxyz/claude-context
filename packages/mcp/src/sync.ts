@@ -138,6 +138,28 @@ export class SyncManager {
         }
     }
 
+    /**
+     * Ordinary checkouts that have the base branch checked out, in repositories
+     * whose base index is maintained from a managed checkout. Syncing one would
+     * write base-branch rows from wherever a developer left it — weeks behind
+     * origin, say — over the managed checkout's fresh ones. The snapshot cannot
+     * be relied on to drop such an entry: every running server re-adds the
+     * entries it loaded at startup whenever it saves.
+     */
+    private unmanagedBaseCheckouts(codebases: string[]): Set<string> {
+        const managedRepos = new Set<string>();
+        const unmanaged: Array<[string, string]> = [];
+        for (const codebasePath of codebases) {
+            if (!fs.existsSync(codebasePath)) continue;
+            const repo = this.context.repositoryId(codebasePath);
+            if (repo === null) continue;
+            const role = this.context.baseCheckoutRole(codebasePath);
+            if (role === 'managed') managedRepos.add(repo);
+            else if (role === 'unmanaged') unmanaged.push([codebasePath, repo]);
+        }
+        return new Set(unmanaged.filter(([, repo]) => managedRepos.has(repo)).map(([p]) => p));
+    }
+
     public async handleSyncIndex(): Promise<void> {
         const syncStartTime = Date.now();
         console.log(`[SYNC-DEBUG] handleSyncIndex() called at ${new Date().toISOString()}`);
@@ -150,6 +172,7 @@ export class SyncManager {
         }
 
         console.log(`[SYNC-DEBUG] Found ${indexedCodebases.length} indexed codebases:`, indexedCodebases);
+        const skipped = this.unmanagedBaseCheckouts(indexedCodebases);
 
         if (this.isSyncing) {
             console.log('[SYNC-DEBUG] Index sync already in progress. Skipping.');
@@ -169,6 +192,10 @@ export class SyncManager {
             for (let i = 0; i < indexedCodebases.length; i++) {
                 const codebasePath = indexedCodebases[i];
                 const codebaseStartTime = Date.now();
+                if (skipped.has(codebasePath)) {
+                    console.log(`[SYNC] Skipping '${codebasePath}': it has the base branch checked out, but its repository's base index follows a managed checkout.`);
+                    continue;
+                }
 
                 console.log(`[SYNC-DEBUG] [${i + 1}/${indexedCodebases.length}] Starting sync for codebase: '${codebasePath}'`);
 

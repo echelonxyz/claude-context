@@ -63,3 +63,30 @@ test("intervals are spread around the configured one, never below the floor", ()
     assert.equal(jittered(600_000, 0, () => 0.7), 600_000);
     assert.equal(jittered(1_000, 0.5, () => 0), 1_000);
 });
+
+test("a developer checkout on the base branch is not synced when a managed base exists", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "claude-context-roles-"));
+    const managed = path.join(root, "managed");
+    const devOnMain = path.join(root, "dev-on-main");
+    const feature = path.join(root, "feature");
+    [managed, devOnMain, feature].forEach((d) => fs.mkdirSync(d));
+    const roles: Record<string, string> = { [managed]: "managed", [devOnMain]: "unmanaged", [feature]: "not-base" };
+    const synced: string[] = [];
+    const context = {
+        repositoryId: () => "repo1",
+        baseCheckoutRole: (p: string) => roles[p],
+        reindexByChange: async (p: string) => { synced.push(p); return { added: 0, removed: 0, modified: 0 }; },
+    } as any;
+    const snapshot = {
+        getIndexedCodebases: () => [managed, devOnMain, feature],
+        getCodebaseInfo: () => undefined,
+    } as any;
+    const manager = new SyncManager(context, snapshot, { lease: new SyncLease({ lockPath: path.join(root, "lock") }) });
+    try {
+        await manager.handleSyncIndex();
+    } finally {
+        manager.stopBackgroundSync();
+        await rm(root, { recursive: true, force: true });
+    }
+    assert.deepEqual(synced, [managed, feature]);
+});
